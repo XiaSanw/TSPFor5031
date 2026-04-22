@@ -32,6 +32,8 @@ from TSPTrainer import TSPTrainer as Trainer
 env_params = {
     'problem_size': 100,
     'pomo_size': 100,
+    # === MODIFIED (Iter-2): mixed-size training up to 250 cities ===
+    'mixed_sizes': [100, 150, 200, 250],
 }
 
 model_params = {
@@ -51,7 +53,8 @@ optimizer_params = {
         'weight_decay': 1e-6
     },
     'scheduler': {
-        'milestones': [3001,],
+        # === MODIFIED (Iter-2): delay LR decay for continued training ===
+        'milestones': [3401,],
         'gamma': 0.1
     }
 }
@@ -59,7 +62,7 @@ optimizer_params = {
 trainer_params = {
     'use_cuda': USE_CUDA,
     'cuda_device_num': CUDA_DEVICE_NUM,
-    'epochs': 3100,
+    'epochs': 3800,  # === MODIFIED (Iter-2): train 800 more epochs on mixed sizes ===
     'train_episodes': 100 * 1000,
     'train_batch_size': 64,
     'logging': {
@@ -75,10 +78,10 @@ trainer_params = {
         },
     },
     'model_load': {
-        'enable': False,  # enable loading pre-trained model
-        # 'path': './result/saved_tsp20_model',  # directory path of pre-trained model and log files saved.
-        # 'epoch': 510,  # epoch version of pre-trained model to laod.
-
+        # === MODIFIED (Iter-2): resume from baseline checkpoint-3000 ===
+        'enable': True,
+        'path': './result/saved_tsp100_model2_longTrain',
+        'epoch': 3000,
     }
 }
 

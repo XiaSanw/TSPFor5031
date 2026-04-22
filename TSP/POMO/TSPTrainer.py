@@ -59,6 +59,11 @@ class TSPTrainer:
             self.scheduler.last_epoch = model_load['epoch']-1
             self.logger.info('Saved Model Loaded !!')
 
+        # === MODIFIED (Iter-2): mixed-size training config ===
+        self.mixed_sizes = self.env_params.get(
+            'mixed_sizes', [self.env_params['problem_size']]
+        )
+
         # utility
         self.time_estimator = TimeEstimator()
 
@@ -130,11 +135,13 @@ class TSPTrainer:
             remaining = train_num_episode - episode
             batch_size = min(self.trainer_params['train_batch_size'], remaining)
 
-            avg_score, avg_loss = self._train_one_batch(batch_size)
-            score_AM.update(avg_score, batch_size)
-            loss_AM.update(avg_loss, batch_size)
+            # === MODIFIED (Iter-2 patch): _train_one_batch 内部会动态缩小 batch_size ===
+            # 必须取实际使用的 batch_size，否则大城市会被错误加权，且 episode 计数虚高
+            avg_score, avg_loss, actual_bs = self._train_one_batch(batch_size)
+            score_AM.update(avg_score, actual_bs)
+            loss_AM.update(avg_loss, actual_bs)
 
-            episode += batch_size
+            episode += actual_bs
 
             # Log First 10 Batch, only at the first epoch
             if epoch == self.start_epoch:
@@ -152,6 +159,24 @@ class TSPTrainer:
         return score_AM.avg, loss_AM.avg
 
     def _train_one_batch(self, batch_size):
+        import random
+
+        # === MODIFIED (Iter-2): weighted random choice of problem size ===
+        # 100 cities trained more frequently, 250 less (hidden test max ~200+)
+        problem_size = random.choices(
+            self.mixed_sizes,
+            weights=[3, 2, 1, 1]
+        )[0]
+        if problem_size != self.env.problem_size:
+            self.env.problem_size = problem_size
+            self.env.pomo_size = problem_size
+
+        # === MODIFIED (Iter-2): dynamic batch_size scaling to avoid OOM ===
+        # VRAM ~ problem_size^2; base = 100 cities @ batch=64
+        base_batch = self.trainer_params['train_batch_size']
+        scale = (100 / problem_size) ** 2
+        adjusted_batch = max(16, int(base_batch * scale))  # floor at 16
+        batch_size = min(adjusted_batch, batch_size)
 
         # Prep
         ###############################################
@@ -192,4 +217,5 @@ class TSPTrainer:
         self.model.zero_grad()
         loss_mean.backward()
         self.optimizer.step()
-        return score_mean.item(), loss_mean.item()
+        # === MODIFIED (Iter-2 patch): 返回实际使用的 batch_size，供上层正确加权与计数 ===
+        return score_mean.item(), loss_mean.item(), batch_size
