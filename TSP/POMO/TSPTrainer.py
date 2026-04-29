@@ -7,6 +7,7 @@ from TSPModel import TSPModel as Model
 
 from torch.optim import Adam as Optimizer
 from torch.optim.lr_scheduler import MultiStepLR as Scheduler
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
 from utils.utils import *
 
@@ -44,11 +45,15 @@ class TSPTrainer:
         self.model = Model(**self.model_params)
         self.env = Env(**self.env_params)
         self.optimizer = Optimizer(self.model.parameters(), **self.optimizer_params['optimizer'])
-        self.scheduler = Scheduler(self.optimizer, **self.optimizer_params['scheduler'])
 
         # Restore
         self.start_epoch = 1
         model_load = trainer_params['model_load']
+        # === Iter-4: cosine annealing + linear warmup ===
+        total_epochs = self.trainer_params['epochs']
+        warmup_epochs = self.optimizer_params['scheduler'].get('warmup_epochs', 200)
+        eta_min = self.optimizer_params['scheduler'].get('eta_min', 1e-6)
+
         if model_load['enable']:
             checkpoint_fullname = '{path}/checkpoint-{epoch}.pt'.format(**model_load)
             checkpoint = torch.load(checkpoint_fullname, map_location=device)
@@ -56,13 +61,28 @@ class TSPTrainer:
             self.start_epoch = 1 + model_load['epoch']
             self.result_log.set_raw_data(checkpoint['result_log'])
             self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            self.scheduler.last_epoch = model_load['epoch']-1
+            # Resume: cosine-only from current epoch
+            remaining = total_epochs - self.start_epoch + 1
+            self.scheduler = CosineAnnealingLR(self.optimizer, T_max=remaining, eta_min=eta_min)
             self.logger.info('Saved Model Loaded !!')
+        else:
+            # Train from scratch: warmup + cosine
+            warmup = LinearLR(self.optimizer, start_factor=0.01, total_iters=warmup_epochs)
+            cosine = CosineAnnealingLR(self.optimizer, T_max=total_epochs - warmup_epochs, eta_min=eta_min)
+            self.scheduler = SequentialLR(self.optimizer, [warmup, cosine], milestones=[warmup_epochs])
 
-        # === MODIFIED (Iter-2): mixed-size training config ===
+        # === Iter-4: mixed-size training config (extended to 300) ===
         self.mixed_sizes = self.env_params.get(
             'mixed_sizes', [self.env_params['problem_size']]
         )
+
+        # === Iter-4: Leader Reward config ===
+        self.leader_reward = self.trainer_params.get('leader_reward', {})
+        self.use_leader_reward = self.leader_reward.get('enable', False)
+        self.leader_alpha = self.leader_reward.get('alpha', 2.0)
+
+        # === Iter-4: training-time augmentation ===
+        self.train_aug_factor = self.trainer_params.get('train_aug_factor', 1)
 
         # utility
         self.time_estimator = TimeEstimator()
@@ -161,27 +181,37 @@ class TSPTrainer:
     def _train_one_batch(self, batch_size):
         import random
 
-        # === MODIFIED (Iter-2): weighted random choice of problem size ===
-        # 100 cities trained more frequently, 250 less (hidden test max ~200+)
+        # === Iter-4: weighted random choice of problem size ===
+        # Weights biased toward large cities (pr299 is main pain point)
         problem_size = random.choices(
             self.mixed_sizes,
-            weights=[3, 2, 1, 1]
+            weights=[1, 2, 3, 3, 3]
         )[0]
         if problem_size != self.env.problem_size:
             self.env.problem_size = problem_size
             self.env.pomo_size = problem_size
 
-        # === MODIFIED (Iter-2): dynamic batch_size scaling to avoid OOM ===
-        # VRAM ~ problem_size^2; base = 100 cities @ batch=64
+        # === Iter-4: relaxed batch scaling (A100 40GB) ===
+        # Floor raised 16→32; large-city gradients much less noisy
         base_batch = self.trainer_params['train_batch_size']
         scale = (100 / problem_size) ** 2
-        adjusted_batch = max(16, int(base_batch * scale))  # floor at 16
+        adjusted_batch = max(32, int(base_batch * scale))
         batch_size = min(adjusted_batch, batch_size)
+
+        # === Iter-4: training-time instance augmentation ===
+        # Scale aug_factor inversely with problem size to stay within VRAM
+        aug_factor = self.train_aug_factor
+        if aug_factor > 1 and problem_size > 200:
+            aug_factor = max(2, aug_factor // 2)  # 8→4 for 250, 8→4 for 300
+        if aug_factor > 1 and problem_size > 250:
+            aug_factor = max(2, aug_factor // 2)  # 4→2 for 300
 
         # Prep
         ###############################################
         self.model.train()
-        self.env.load_problems(batch_size)
+        self.env.load_problems(batch_size, aug_factor=aug_factor)
+        # augmentation expands batch_size N-fold
+        batch_size = self.env.batch_size
         reset_state, _, _ = self.env.reset()
         self.model.pre_forward(reset_state)
 
@@ -197,25 +227,34 @@ class TSPTrainer:
             state, reward, done = self.env.step(selected)
             prob_list = torch.cat((prob_list, prob[:, :, None]), dim=2)
 
-        # Loss
-        ###############################################
-        advantage = reward - reward.float().mean(dim=1, keepdims=True)
-        # shape: (batch, pomo)
-        log_prob = prob_list.log().sum(dim=2)
-        # size = (batch, pomo)
-        loss = -advantage * log_prob  # Minus Sign: To Increase REWARD
-        # shape: (batch, pomo)
+        # === Iter-4: Leader Reward (Wang et al., 2024) ===
+        # Standard POMO baseline: per-instance mean reward
+        baseline = reward.float().mean(dim=1, keepdims=True)
+        advantage = reward - baseline  # shape: (batch, pomo)
+
+        if self.use_leader_reward:
+            alpha = self.leader_alpha
+            # Identify leader: trajectory with highest advantage per problem
+            leader_idx = advantage.argmax(dim=1)  # (batch,)
+            batch_idx = torch.arange(batch_size, device=advantage.device)
+            # Boost leader
+            advantage[batch_idx, leader_idx] *= alpha
+            # Normalize all advantages (stabilizes Adam when α > 1)
+            advantage = advantage / alpha
+
+        # REINFORCE loss
+        log_prob = prob_list.log().sum(dim=2)  # (batch, pomo)
+        loss = -advantage * log_prob  # shape: (batch, pomo)
         loss_mean = loss.mean()
 
         # Score
         ###############################################
-        max_pomo_reward, _ = reward.max(dim=1)  # get best results from pomo
-        score_mean = -max_pomo_reward.float().mean()  # negative sign to make positive value
+        max_pomo_reward, _ = reward.max(dim=1)
+        score_mean = -max_pomo_reward.float().mean()
 
         # Step & Return
         ###############################################
         self.model.zero_grad()
         loss_mean.backward()
         self.optimizer.step()
-        # === MODIFIED (Iter-2 patch): 返回实际使用的 batch_size，供上层正确加权与计数 ===
         return score_mean.item(), loss_mean.item(), batch_size
