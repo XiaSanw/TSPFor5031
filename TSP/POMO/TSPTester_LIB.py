@@ -25,57 +25,6 @@ def _normalize_to_unit_square(node_xy: torch.Tensor) -> torch.Tensor:
 
 ###############################################################################
 
-def _compute_dist_matrix(coords, edge_weight_type='EUC_2D'):
-    """计算距离矩阵。coords: (N, 2) tensor -> list of list (Python 嵌套列表)"""
-    diff = coords.unsqueeze(0) - coords.unsqueeze(1)
-    dists = (diff ** 2).sum(dim=2).sqrt()
-    if edge_weight_type == 'CEIL_2D':
-        dists = torch.ceil(dists)
-    elif edge_weight_type == 'EUC_2D':
-        dists = torch.floor(dists + 0.5)
-    return dists.cpu().tolist()
-
-
-def _two_opt(tour, dist_matrix, max_iter=10000):
-    """
-    经典 2-opt 局部搜索。
-    tour: 城市索引列表，如 [0, 3, 1, 2]
-    dist_matrix: Python 嵌套列表，dist_matrix[i][j] = 城市 i 到 j 的距离
-    返回优化后的 tour。
-    """
-    n = len(tour)
-    tour = list(tour)
-    improved = True
-    iter_count = 0
-    while improved and iter_count < max_iter:
-        improved = False
-        for i in range(1, n - 1):
-            for j in range(i + 1, n):
-                # 当前边：tour[i-1]->tour[i] 和 tour[j]->tour[j+1]
-                # 候选边：tour[i-1]->tour[j] 和 tour[i]->tour[j+1]
-                a, b = tour[i - 1], tour[i]
-                c, d = tour[j], tour[(j + 1) % n]
-                delta = (dist_matrix[a][c] + dist_matrix[b][d]
-                            - dist_matrix[a][b] - dist_matrix[c][d])
-                if delta < -1e-6:
-                    # 反转 tour[i..j] 这一段
-                    tour[i:j + 1] = reversed(tour[i:j + 1])
-                    improved = True
-                    break
-            if improved:
-                break
-        iter_count += 1
-    return tour
-
-def _tour_length(tour, dist_matrix):
-    """计算一条路线的总长度。"""
-    n = len(tour)
-    return sum(dist_matrix[tour[i]][tour[(i + 1) % n]] for i in range(n))
-
-
-###############################################################################
-
-
 @dataclass
 class LibResult:
     instances: List[str]
@@ -281,57 +230,7 @@ class TSPTester_LIB:
 
         return result
 
-    # def _test_one_instance(self, nodes_xy_normalized: torch.Tensor, coords_orig: torch.Tensor, ew_type: str) -> Tuple[float, float]:
-    #     if self.tester_params['augmentation_enable']:
-    #         aug_factor = self.tester_params['aug_factor']
-    #         if aug_factor != 8:
-    #             raise NotImplementedError('Only aug_factor=8 is supported.')
-    #     else:
-    #         aug_factor = 1
-
-    #     problems = nodes_xy_normalized
-    #     if aug_factor > 1:
-    #         problems = augment_xy_data_by_8_fold(problems)
-
-    #     effective_batch = problems.size(0)
-    #     problem_size = problems.size(1)
-
-    #     env = Env(problem_size=problem_size, pomo_size=problem_size)
-
-    #     env.batch_size = effective_batch
-    #     env.problems = problems.to(self.device)
-    #     env.BATCH_IDX = torch.arange(effective_batch, device=self.device)[:, None].expand(effective_batch, env.pomo_size)
-    #     env.POMO_IDX = torch.arange(env.pomo_size, device=self.device)[None, :].expand(effective_batch, env.pomo_size)
-
-    #     # Unify TSPLIB scoring: let Env compute integer tour length.
-    #     # - original coords are used for TSPLIB cost (not normalized)
-    #     # - edge_weight_type controls EUC_2D vs CEIL_2D discretization
-    #     env.original_node_xy_lib = coords_orig[None, :, :]
-    #     env.edge_weight_type = ew_type
-
-    #     self.model.eval()
-    #     with torch.no_grad():
-    #         reset_state, _, _ = env.reset()
-    #         self.model.pre_forward(reset_state)
-
-    #         state, reward, done = env.pre_step()
-    #         while not done:
-    #             selected, _ = self.model(state)
-    #             state, reward, done = env.step(selected, lib_mode=True)
-
-    #     # reward is negative tour length at the final step
-    #     tour_lengths = -reward
-    #     best_len_per_aug = tour_lengths.min(dim=1).values
-    #     no_aug_score = best_len_per_aug[0].item()
-    #     aug_score = best_len_per_aug.min(dim=0).values.item()
-
-    #     return float(no_aug_score), float(aug_score)
-
-    ######################### 融入多重采样和2-opt的版本##########################
-    def _test_one_instance(self, nodes_xy_normalized: torch.Tensor,
-                           coords_orig: torch.Tensor, ew_type: str
-                           ) -> Tuple[float, float]:
-        # ------ 读取参数 ------
+    def _test_one_instance(self, nodes_xy_normalized: torch.Tensor, coords_orig: torch.Tensor, ew_type: str) -> Tuple[float, float]:
         if self.tester_params['augmentation_enable']:
             aug_factor = self.tester_params['aug_factor']
             if aug_factor != 8:
@@ -339,101 +238,40 @@ class TSPTester_LIB:
         else:
             aug_factor = 1
 
-        num_samples = self.tester_params.get('num_samples', 1)
-        enable_2opt = self.tester_params.get('enable_2opt', False)
-
-        # ------ 数据增强 ------
         problems = nodes_xy_normalized
         if aug_factor > 1:
             problems = augment_xy_data_by_8_fold(problems)
 
-        effective_batch = problems.size(0)   # 1 或 8（有增强时）
+        effective_batch = problems.size(0)
         problem_size = problems.size(1)
 
-        # ------ 初始化环境 ------
         env = Env(problem_size=problem_size, pomo_size=problem_size)
+
         env.batch_size = effective_batch
         env.problems = problems.to(self.device)
-        env.BATCH_IDX = torch.arange(effective_batch, device=self.device)[:, None].expand(
-            effective_batch, env.pomo_size)
-        env.POMO_IDX = torch.arange(env.pomo_size, device=self.device)[None, :].expand(
-            effective_batch, env.pomo_size)
+        env.BATCH_IDX = torch.arange(effective_batch, device=self.device)[:, None].expand(effective_batch, env.pomo_size)
+        env.POMO_IDX = torch.arange(env.pomo_size, device=self.device)[None, :].expand(effective_batch, env.pomo_size)
+
+        # Unify TSPLIB scoring: let Env compute integer tour length.
+        # - original coords are used for TSPLIB cost (not normalized)
+        # - edge_weight_type controls EUC_2D vs CEIL_2D discretization
         env.original_node_xy_lib = coords_orig[None, :, :]
         env.edge_weight_type = ew_type
 
-        # ------ 预计算距离矩阵（2-opt 用）------
-        dist_matrix = None
-        if enable_2opt:
-            dist_matrix = _compute_dist_matrix(coords_orig, ew_type)
-
-        # ------ 多采样推理 ------
         self.model.eval()
-        all_sample_best = []     # 每次采样的最优路线长度
-
         with torch.no_grad():
-            # Encoder 只算一次（所有采样共享同一个编码结果）
             reset_state, _, _ = env.reset()
             self.model.pre_forward(reset_state)
-            saved_eval = self.model.model_params['eval_type']
 
-            for sample_id in range(num_samples):
-                # 前 N-1 次用 softmax 随机采样，最后一次用 argmax 贪心
-                self.model.model_params['eval_type'] = (
-                    'softmax' if num_samples > 1 and sample_id < num_samples - 1
-                    else 'argmax'
-                )
+            state, reward, done = env.pre_step()
+            while not done:
+                selected, _ = self.model(state)
+                state, reward, done = env.step(selected, lib_mode=True)
 
-                # 手动重置环境的动态状态（不需要重新编码，所以不调 env.reset()）
-                env.selected_count = 0
-                env.current_node = None
-                env.selected_node_list = torch.zeros(
-                    (effective_batch, env.pomo_size, 0),
-                    dtype=torch.long, device=self.device
-                )
-                env.step_state = Step_State(
-                    BATCH_IDX=env.BATCH_IDX, POMO_IDX=env.POMO_IDX
-                )
-                env.step_state.ninf_mask = torch.zeros(
-                    (effective_batch, env.pomo_size, problem_size),
-                    device=self.device
-                )
-
-                # Decoder 逐步选城市
-                state, reward, done = env.pre_step()
-                while not done:
-                    selected, _ = self.model(state)
-                    state, reward, done = env.step(selected, lib_mode=True)
-
-                # reward 是负路程，取反得到实际路程
-                tour_lengths = -reward   # shape: (effective_batch, pomo_size)
-
-                # ------ 可选：2-opt 后处理 ------
-                if enable_2opt:
-                    batch_best_lengths = []
-                    best_pomo_idx = tour_lengths.argmin(dim=1)
-                    for b in range(effective_batch):
-                        pidx = best_pomo_idx[b].item()
-                        tour = env.selected_node_list[b, pidx].cpu().tolist()
-                        optimized = _two_opt(tour, dist_matrix)
-                        opt_len = _tour_length(optimized, dist_matrix)
-                        batch_best_lengths.append(opt_len)
-                    all_sample_best.append(
-                        torch.tensor(batch_best_lengths, dtype=torch.float32)
-                    )
-                else:
-                    # 不做 2-opt，直接取每个 aug batch 里最短的 POMO 路线
-                    all_sample_best.append(tour_lengths.min(dim=1).values.cpu())
-
-            # 恢复原来的 eval_type
-            self.model.model_params['eval_type'] = saved_eval
-
-        # ------ 合并所有采样结果 ------
-        all_sample_best = torch.stack(all_sample_best, dim=0)
-        # shape: (num_samples, effective_batch)
-
-        # no_aug_score: 第 0 个 batch（无增强版本）在所有采样中的最优
-        no_aug_score = all_sample_best[:, 0].min().item()
-        # aug_score: 所有采样 x 所有增强版本中的全局最优
-        aug_score = all_sample_best.min().item()
+        # reward is negative tour length at the final step
+        tour_lengths = -reward
+        best_len_per_aug = tour_lengths.min(dim=1).values
+        no_aug_score = best_len_per_aug[0].item()
+        aug_score = best_len_per_aug.min(dim=0).values.item()
 
         return float(no_aug_score), float(aug_score)

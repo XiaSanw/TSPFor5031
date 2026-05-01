@@ -84,19 +84,32 @@ class TSPTrainer:
         # === Iter-4: training-time augmentation ===
         self.train_aug_factor = self.trainer_params.get('train_aug_factor', 1)
 
+        # === BC -> RL transition config ===
+        self.bc_transition = None  # injected by train.py
+
         # utility
         self.time_estimator = TimeEstimator()
 
     def run(self):
         self.time_estimator.reset(self.start_epoch)
         for epoch in range(self.start_epoch, self.trainer_params['epochs']+1):
-            self.logger.info('=================================================================')
+            # === BC -> RL transition: unfreeze encoder ===
+            if (self.bc_transition is not None
+                    and self.bc_transition.get('freeze_encoder_epochs', 0) > 0
+                    and epoch == self.bc_transition['freeze_encoder_epochs'] + 1):
+                for param in self.model.encoder.parameters():
+                    param.requires_grad = True
+                self.optimizer.add_param_group({
+                    'params': list(self.model.encoder.parameters())
+                })
+                self.logger.info('>>> Encoder UNFROZEN at epoch {}, params added to optimizer <<<'.format(epoch))
 
-            # LR Decay
-            self.scheduler.step()
+            self.logger.info('=================================================================')
 
             # Train
             train_score, train_loss = self._train_one_epoch(epoch)
+            # LR Decay (must be after optimizer.step() per PyTorch >= 1.1)
+            self.scheduler.step()
             self.result_log.append('train_score', epoch, train_score)
             self.result_log.append('train_loss', epoch, train_loss)
 
@@ -185,26 +198,28 @@ class TSPTrainer:
         # Weights biased toward large cities (pr299 is main pain point)
         problem_size = random.choices(
             self.mixed_sizes,
-            weights=[1, 2, 3, 3, 3]
+            weights=[1, 2, 3, 3]
         )[0]
         if problem_size != self.env.problem_size:
             self.env.problem_size = problem_size
             self.env.pomo_size = problem_size
 
         # === Iter-4: relaxed batch scaling (A100 40GB) ===
-        # Floor raised 16→32; large-city gradients much less noisy
-        base_batch = self.trainer_params['train_batch_size']
-        scale = (100 / problem_size) ** 2
-        adjusted_batch = max(32, int(base_batch * scale))
-        batch_size = min(adjusted_batch, batch_size)
-
-        # === Iter-4: training-time instance augmentation ===
-        # Scale aug_factor inversely with problem size to stay within VRAM
         aug_factor = self.train_aug_factor
-        if aug_factor > 1 and problem_size > 200:
-            aug_factor = max(2, aug_factor // 2)  # 8→4 for 250, 8→4 for 300
-        if aug_factor > 1 and problem_size > 250:
-            aug_factor = max(2, aug_factor // 2)  # 4→2 for 300
+
+        if aug_factor > 1:
+            # With augmentation: effective_batch * problem_size^2 ≈ constant
+            vram_budget = 32 * aug_factor * (100 ** 2)
+            effective_target = int(vram_budget / (problem_size ** 2))
+            effective_target = max(aug_factor * 2, min(aug_factor * 32, effective_target))
+            base_batch = max(2, effective_target // aug_factor)
+        else:
+            # No augmentation: standard quadratic scaling, floor at 16
+            base_batch = self.trainer_params['train_batch_size']
+            scale = (100 / problem_size) ** 2
+            base_batch = max(16, int(base_batch * scale))
+
+        batch_size = min(base_batch, batch_size)
 
         # Prep
         ###############################################
@@ -258,3 +273,99 @@ class TSPTrainer:
         loss_mean.backward()
         self.optimizer.step()
         return score_mean.item(), loss_mean.item(), batch_size
+
+    def _train_one_epoch_bc(self, epoch, bc_data_loader):
+        """
+        Behavior Cloning pretraining for one epoch.
+
+        Key design:
+        1. Rotate LKH3 tour to construct expert action sequence per POMO start point
+        2. Teacher forcing: env steps by expert action, model supervised at each step
+        3. Loss covers all N trajectories (N=problem_size), not just trajectory 0
+        """
+        from TSPModel import _get_encoding
+
+        self.model.train()
+        loss_AM = AverageMeter()
+        device = next(self.model.parameters()).device
+
+        for batch_idx, batch in enumerate(bc_data_loader):
+            problems = batch['problem'].to(device)   # (B, N, 2)
+            tours = batch['tour'].to(device)          # (B, N)
+
+            batch_size = problems.size(0)
+            problem_size = problems.size(1)
+            pomo_size = problem_size
+
+            # ---- 1. Inject problems into env ----
+            self.env.problem_size = problem_size
+            self.env.pomo_size = pomo_size
+            self.env.batch_size = batch_size
+            self.env.problems = problems
+            self.env.BATCH_IDX = torch.arange(batch_size, device=device)[:, None].expand(batch_size, pomo_size)
+            self.env.POMO_IDX = torch.arange(pomo_size, device=device)[None, :].expand(batch_size, pomo_size)
+
+            # ---- 2. Construct expert action matrix (vectorized) ----
+            # tour_positions[b, city] = index of city in tours[b]
+            tour_positions = torch.zeros(batch_size, problem_size, dtype=torch.long, device=device)
+            positions = torch.arange(problem_size, device=device).unsqueeze(0).expand(batch_size, -1)
+            tour_positions.scatter_(1, tours, positions)
+
+            # Concatenate tour with itself to avoid modulo
+            cyclic_tours = torch.cat([tours, tours], dim=1)  # (B, 2N)
+
+            # For each start position p, expert actions are at cyclic_tours[p+1 ... p+N-1]
+            offsets = torch.arange(1, problem_size, device=device)                # (N-1,)
+            indices_3d = tour_positions[:, :, None] + offsets[None, None, :]      # (B, N, N-1)
+            indices_flat = indices_3d.reshape(batch_size, -1)                     # (B, N*(N-1))
+
+            expert_actions = torch.gather(cyclic_tours, 1, indices_flat)          # (B, N*(N-1))
+            expert_actions = expert_actions.reshape(batch_size, pomo_size, problem_size - 1)
+            # expert_actions[b, s, t] = expert action at step t+1 for trajectory s
+
+            # ---- 3. Env reset + Encoder forward ----
+            reset_state, _, _ = self.env.reset()
+            self.model.pre_forward(reset_state)
+
+            # ---- 4. POMO rollout with teacher forcing ----
+            prob_list = []  # collect per-step (B, POMO) probs
+            state, reward, done = self.env.pre_step()
+
+            for step in range(problem_size):
+                if step == 0:
+                    # Step 0: POMO initialization — trajectory i starts from city i
+                    selected = torch.arange(pomo_size, device=device)[None, :].expand(batch_size, pomo_size)
+
+                    # Set decoder q_first (first-node embedding), same as TSPModel.forward
+                    encoded_first_node = _get_encoding(self.model.encoded_nodes, selected)
+                    self.model.decoder.set_q1(encoded_first_node)
+
+                    state, reward, done = self.env.step(selected)
+                else:
+                    # Get model's action probability distribution
+                    encoded_last_node = _get_encoding(self.model.encoded_nodes, state.current_node)
+                    probs = self.model.decoder(encoded_last_node, ninf_mask=state.ninf_mask)
+                    # probs: (B, POMO, N)
+
+                    # Extract expert action probability (clamped to avoid log(0))
+                    expert = expert_actions[:, :, step - 1]  # (B, POMO)
+                    prob = probs[self.env.BATCH_IDX, self.env.POMO_IDX, expert]  # (B, POMO)
+                    prob_list.append(prob)
+
+                    # Teacher forcing: env steps by expert action
+                    state, reward, done = self.env.step(expert)
+
+            # ---- 5. BC Loss ----
+            # prob_list has N-1 elements, each (B, POMO)
+            all_probs = torch.stack(prob_list, dim=2)                # (B, POMO, N-1)
+            log_probs = torch.clamp(all_probs, min=1e-8).log()      # numerical stability
+            total_log_prob = log_probs.sum(dim=2)                    # (B, POMO)
+            loss = -total_log_prob.mean()                            # scalar
+
+            self.model.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+            loss_AM.update(loss.item(), batch_size)
+
+        self.logger.info('Epoch {:3d}: BC Loss: {:.4f}'.format(epoch, loss_AM.avg))
+        return loss_AM.avg
